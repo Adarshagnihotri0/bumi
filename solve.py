@@ -209,6 +209,30 @@ def _apply_shift_lonlat(geom_4326, dx_m, dy_m, ref_lat):
     return translate(geom_4326, dlon, dlat)
 
 
+def _densify_geom(geom_img_crs, spacing_m: float = 2.0) -> np.ndarray:
+    """Return densified exterior sample points spaced ~spacing_m apart.
+
+    Sparse cadastral polygons (4–8 vertices) give the ICP median very few
+    samples.  Interpolating every 2 m yields 50–200 points per parcel,
+    dramatically stabilising the shift estimate and reducing sensitivity
+    to individual vertex outliers.
+    """
+    def _ring_pts(ring):
+        length = ring.length
+        if length == 0:
+            return np.array(ring.coords)
+        n = max(int(length / spacing_m), len(ring.coords))
+        distances = np.linspace(0, length, n, endpoint=False)
+        pts = [ring.interpolate(d) for d in distances]
+        return np.array([(p.x, p.y) for p in pts])
+
+    if hasattr(geom_img_crs, 'exterior'):
+        return _ring_pts(geom_img_crs.exterior)
+    else:
+        parts = [_ring_pts(part.exterior) for part in geom_img_crs.geoms]
+        return np.vstack(parts)
+
+
 # ════════════════════════════════════════════════════════════════════════════════════
 # ICP (Iterative Closest Point) Core Algorithm
 # ════════════════════════════════════════════════════════════════════════════════════
@@ -234,20 +258,9 @@ def _icp_shift(geom_img_crs, edge_kd, edge_coords, max_dist_m, res_m):
     if edge_kd is None:
         return 0.0, 0.0, 0.0, 'no_signal', 0.0
 
-    def _verts(g):
-        if hasattr(g, 'exterior'):
-            return list(g.exterior.coords)
-        else:
-            verts = []
-            for part in g.geoms:
-                verts.extend(list(part.exterior.coords))
-            return verts
-
-    verts = _verts(geom_img_crs)
-    if not verts:
+    verts = _densify_geom(geom_img_crs, spacing_m=2.0)
+    if len(verts) == 0:
         return 0.0, 0.0, 0.0, 'no_signal', 0.0
-
-    verts = np.array(verts)
     dists, idxs = edge_kd.query(verts, distance_upper_bound=max_dist_m)
 
     valid = dists < max_dist_m
@@ -317,44 +330,49 @@ def compute_area_ratio_score(map_area: float, rec_area: float, pot_kharaba_ha: f
     return 0.0
 
 
-def _idw_predict(query_lon, query_lat, anchor_lons, anchor_lats, anchor_dxs, anchor_dys,
-                 anchor_trusts=None, power=2.0):
-    """Inverse-distance weighted interpolation of (dx, dy) at a query point.
-    trust weights scale each anchor's contribution (L1=1.0, L2=0.8)."""
-    if anchor_trusts is None:
-        anchor_trusts = [1.0] * len(anchor_lons)
-    weights, wdxs, wdys = [], [], []
-    for alon, alat, adx, ady, atr in zip(anchor_lons, anchor_lats, anchor_dxs, anchor_dys, anchor_trusts):
-        d = _dist_m(query_lon, query_lat, alon, alat) + 1e-6
-        w = atr / (d ** power)
-        weights.append(w); wdxs.append(w * adx); wdys.append(w * ady)
-    sw = sum(weights)
-    return sum(wdxs) / sw, sum(wdys) / sw
-
-
 def _zscore_agreement(dx_m, dy_m, query_lon, query_lat,
                       anchor_lons, anchor_lats, anchor_dxs, anchor_dys,
-                      radius_m=AGREEMENT_RADIUS_M):
+                      anchor_trusts=None, radius_m=AGREEMENT_RADIUS_M):
     """Continuous agreement score: how unusual is (dx, dy) vs nearby anchors?
 
     Returns a value in [0, 1]:
       1.0 = shift is exactly what nearby anchors predict
       0.5 = no anchors nearby (neutral — don't penalise, don't reward)
       0.0 = shift is a major outlier vs neighbours
+
+    anchor_trusts weights each anchor's contribution (L1=1.0, L2=0.8).
+    Weighted median and weighted variance are used so high-trust anchors
+    (ground-truth L1) have stronger pull on the reference displacement field.
     """
-    nearby_dx, nearby_dy = [], []
-    for alon, alat, adx, ady in zip(anchor_lons, anchor_lats, anchor_dxs, anchor_dys):
+    trusts = anchor_trusts if anchor_trusts is not None else [1.0] * len(anchor_lons)
+    nearby_dx, nearby_dy, nearby_w = [], [], []
+    for alon, alat, adx, ady, atr in zip(anchor_lons, anchor_lats, anchor_dxs, anchor_dys, trusts):
         if _dist_m(query_lon, query_lat, alon, alat) <= radius_m:
             nearby_dx.append(adx)
             nearby_dy.append(ady)
+            nearby_w.append(atr)
 
     if len(nearby_dx) < 3:
         return 0.5  # neutral — network too sparse here yet
 
-    med_dx = float(np.median(nearby_dx))
-    med_dy = float(np.median(nearby_dy))
-    std_dx = float(np.std(nearby_dx)) + 1e-3
-    std_dy = float(np.std(nearby_dy)) + 1e-3
+    # Trust-weighted median: sort by value, find where cumulative weight crosses 50%
+    def _wmedian(vals, wts):
+        order = np.argsort(vals)
+        sv = np.array(vals)[order]
+        sw = np.array(wts)[order]
+        cum = np.cumsum(sw)
+        idx = np.searchsorted(cum, cum[-1] * 0.5)
+        return float(sv[min(idx, len(sv) - 1)])
+
+    med_dx = _wmedian(nearby_dx, nearby_w)
+    med_dy = _wmedian(nearby_dy, nearby_w)
+
+    # Trust-weighted standard deviation
+    w = np.array(nearby_w)
+    dx_arr = np.array(nearby_dx)
+    dy_arr = np.array(nearby_dy)
+    std_dx = float(np.sqrt(np.sum(w * (dx_arr - med_dx) ** 2) / np.sum(w))) + 1e-3
+    std_dy = float(np.sqrt(np.sum(w * (dy_arr - med_dy) ** 2) / np.sum(w))) + 1e-3
 
     z = math.sqrt(((dx_m - med_dx) / std_dx) ** 2 + ((dy_m - med_dy) / std_dy) ** 2)
     # z=0 → score=1.0;  z=2 → score≈0.37;  z=4 → score≈0.02
@@ -440,7 +458,7 @@ def reassess_plot(pn, geom, props, img_crs, edge_src,
         area_ratio_score = compute_area_ratio_score(map_area, rec_area, pot_kh)
         agreement = _zscore_agreement(
             dx_m, dy_m, clon, clat,
-            anchor_lons, anchor_lats, anchor_dxs, anchor_dys
+            anchor_lons, anchor_lats, anchor_dxs, anchor_dys, anchor_trusts
         )
         
         icp_quality = inlier_frac if failure_mode != 'no_signal' else 0.0
@@ -583,7 +601,7 @@ def main():
         # ── Confidence Signals ────────────────────────────────────────────────
         agreement = _zscore_agreement(
             dx_m, dy_m, clon, clat,
-            anchor_lons, anchor_lats, anchor_dxs, anchor_dys
+            anchor_lons, anchor_lats, anchor_dxs, anchor_dys, anchor_trusts
         )
 
         # ── H1 Score: Joint Evidence ──────────────────────────────────────────
@@ -627,7 +645,10 @@ def main():
     # ── Commit L2 anchors (deduplicated) ──────────────────────────────────────
     seen = set()
     for alon, alat, adx, ady in l2_queue:
-        key = (round(alon, 5), round(alat, 5))
+        # 100m grid cell: prevents cluster self-reinforcement where a
+        # locally-correlated ICP mistake gets amplified via dense neighbours.
+        # round(_, 3) ≈ 0.001° ≈ 111 m per cell.
+        key = (round(alon, 3), round(alat, 3))
         if key not in seen:
             seen.add(key)
             anchor_lons.append(alon)
