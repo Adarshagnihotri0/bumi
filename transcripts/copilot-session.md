@@ -271,3 +271,5 @@ The challenge evaluates confidence calibration in addition to geometric correcti
 
 
 https://claude.ai/share/9653aef8-1c3d-451c-b6be-ca84a198fd0b
+
+https://chatgpt.com/share/6a29aff1-84b4-83e8-8019-1fbafe72dc61
