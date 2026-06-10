@@ -76,11 +76,17 @@ L2_RATIO_HI = 1.15
 L2_TRUST = 0.80         # Trust weight (L1 truths = 1.0)
 
 # Second pass reassessment: upgrade flagged → corrected if confidence >= this threshold
-# Set lower than MIN_CONFIDENCE (0.25) to catch borderline cases with improved anchor coverage
-REASSESSMENT_THRESHOLD = 0.32
+# Set BELOW MIN_CONFIDENCE (0.25) so pass 2 is genuinely more lenient; enriched anchor
+# network (6 → 385) justifies accepting borderline cases we couldn't trust in pass 1.
+REASSESSMENT_THRESHOLD = 0.20
 
 # Second pass: use a lower shift threshold since we have much better anchor coverage
 REASSESSMENT_MIN_SHIFT_M = 1.0  # vs 1.5m in pass 1
+
+# Neighbour agreement search radius (metres).
+# 600m ≈ 25–30 × typical plot width in this dataset (~20m), giving a neighbourhood
+# large enough to hold 10–30 anchors on average while staying sub-village scale.
+AGREEMENT_RADIUS_M = 600.0
 
 
 # ════════════════════════════════════════════════════════════════════════════════════
@@ -328,7 +334,7 @@ def _idw_predict(query_lon, query_lat, anchor_lons, anchor_lats, anchor_dxs, anc
 
 def _zscore_agreement(dx_m, dy_m, query_lon, query_lat,
                       anchor_lons, anchor_lats, anchor_dxs, anchor_dys,
-                      radius_m=600):
+                      radius_m=AGREEMENT_RADIUS_M):
     """Continuous agreement score: how unusual is (dx, dy) vs nearby anchors?
 
     Returns a value in [0, 1]:
@@ -670,6 +676,7 @@ def main():
     
     upgraded = 0
     upgraded_details = {"conf_improved": 0}
+    confidence_deltas: list[float] = []
     
     for i, flag_result in enumerate(flagged):
         if i % 100 == 0 and i > 0:
@@ -696,8 +703,17 @@ def main():
         
         shift_m = math.sqrt(dx_m**2 + dy_m**2)
         
+        # Track confidence delta (pass2_h1 - pass1_h1) for all reassessed plots
+        try:
+            note = flag_result.get("method_note", "")
+            p1_h1 = float(note.split("h1=")[1].split()[0])
+            confidence_deltas.append(h1_score - p1_h1)
+        except (IndexError, ValueError):
+            pass
+        
         # If confidence now meets threshold, upgrade from flagged → corrected
-        if can_upgrade and h1_score >= MIN_CONFIDENCE and shift_m >= REASSESSMENT_MIN_SHIFT_M:
+        # can_upgrade already encodes h1_score >= REASSESSMENT_THRESHOLD (0.20)
+        if can_upgrade and shift_m >= REASSESSMENT_MIN_SHIFT_M:
             clon, clat = geom.centroid.x, geom.centroid.y
             new_geom = _apply_shift_lonlat(geom, dx_m, dy_m, clat)
             
@@ -713,6 +729,19 @@ def main():
     print(f"  upgraded: {upgraded} plots from flagged → corrected")
     if upgraded > 0:
         print(f"    - confidence improved: {upgraded_details['conf_improved']}")
+    
+    # Confidence delta analysis: did pass 2 reveal new evidence or just confirm uncertainty?
+    if confidence_deltas:
+        deltas = sorted(confidence_deltas)
+        n = len(deltas)
+        median_d = deltas[n // 2]
+        p95_d = deltas[int(n * 0.95)]
+        max_d = deltas[-1]
+        print(f"  confidence_delta (pass2 - pass1): median={median_d:+.3f}  p95={p95_d:+.3f}  max={max_d:+.3f}")
+        if max_d < 0.05:
+            print("  → Pass 2 confirmed uncertainty rather than revealing new evidence.")
+        else:
+            print(f"  → {sum(d > 0.05 for d in deltas)} plots gained meaningful confidence in pass 2.")
     
     # Update counts
     corrected = [r for r in results if r["status"] == "corrected"]
