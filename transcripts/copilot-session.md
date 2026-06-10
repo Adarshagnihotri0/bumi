@@ -266,3 +266,8 @@ Area consistency contains no directional information and therefore cannot determ
 **Why not classify parcels directly as correct or incorrect?**
 
 The challenge evaluates confidence calibration in addition to geometric correction quality. Continuous confidence scores preserve substantially more ranking information than binary decisions.
+
+
+
+
+https://claude.ai/share/9653aef8-1c3d-451c-b6be-ca84a198fd0b
