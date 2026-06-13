@@ -73,15 +73,34 @@ This adds constraint propagation while preserving imagery-only geometry updates.
 
 ## Results (public example truths, Vadnerbhairav)
 
+Evaluation subset summary:
+
+- 5 corrected
+- 1 flagged
+- 6 total truths
+
 | Metric | Official | Ours |
 |---|---|---|
-| Median IoU | 0.612 | **0.794** |
-| Improvement | - | **+0.211** |
-| Accurate @ IoU≥0.5 | — | **100%** |
-| Centroid error | — | **8.7m** |
-| Calibration ρ | — | 0.40 (4 pts, not meaningful) |
+| Median IoU | 0.612 | **0.749** |
+| Improvement | - | **+0.128** |
+| Plots improved vs official | - | **100%** |
+| Accurate @ IoU>=0.5 | - | **80%** |
+| Median centroid error | - | **11.0m** |
+| Calibration AUC | - | **1.000** |
+| Restraint | Hidden-set only | N/A on public truths |
 
-Note: corrected/flagged totals depend on current thresholds and iterative pass settings.
+Metric definitions:
+
+- Median IoU: typical overlap with truth (shared / combined area), range [0, 1]
+- Improvement: IoU gain over the official baseline
+- Accurate @ IoU>=0.5: share of corrected plots with solid overlap
+- Centroid error: distance between prediction and truth centroids
+- Calibration AUC: whether confidence ranks better fixes above weaker ones (0.5 chance, 1.0 perfect)
+- Restraint: whether already-correct plots were left untouched (graded on hidden set)
+
+Important caveat:
+
+These public truths are only a handful of examples, so treat these numbers as a rough directional check, not a grade. Calibration especially needs more samples to be meaningful. The final score is determined on a larger hidden evaluation set.
 
 ## What I learned from the data
 
