@@ -36,6 +36,7 @@ from pyproj import Transformer
 from shapely.geometry import shape, mapping
 from shapely.affinity import translate
 from shapely.ops import transform as shp_transform
+from shapely.strtree import STRtree
 from scipy.spatial import cKDTree
 
 warnings.filterwarnings("ignore")
@@ -87,6 +88,17 @@ REASSESSMENT_MIN_SHIFT_M = 1.0  # vs 1.5m in pass 1
 # 600m ≈ 25–30 × typical plot width in this dataset (~20m), giving a neighbourhood
 # large enough to hold 10–30 anchors on average while staying sub-village scale.
 AGREEMENT_RADIUS_M = 600.0
+
+# Topology-aware agreement weight. Radius agreement captures local drift field,
+# topology agreement captures shared-boundary consistency.
+TOPOLOGY_AGREEMENT_WEIGHT = 0.35
+
+# Re-assessment now iterates until no new anchors/corrections appear.
+MAX_REASSESSMENT_PASSES = 6
+
+# Minimum shared boundary length (metres, in image CRS units) to treat two
+# parcels as topological neighbours.
+MIN_SHARED_BOUNDARY_M = 0.5
 
 
 # ════════════════════════════════════════════════════════════════════════════════════
@@ -379,6 +391,84 @@ def _zscore_agreement(dx_m, dy_m, query_lon, query_lat,
     return float(math.exp(-z / 2.0))
 
 
+def build_adjacency_graph(features) -> dict[str, set[str]]:
+    """Build parcel adjacency graph using shared-boundary topology.
+
+    Two parcels are considered adjacent if geometries touch/intersect. We use
+    an STRtree for candidate filtering and keep only true topological neighbours.
+    """
+    plot_numbers = [str(feat["properties"]["plot_number"]) for feat in features]
+    geoms = [shape(feat["geometry"]) for feat in features]
+    adjacency = {pn: set() for pn in plot_numbers}
+
+    tree = STRtree(geoms)
+    geom_id_to_idx = {id(g): i for i, g in enumerate(geoms)}
+
+    for i, geom in enumerate(geoms):
+        # Shapely returns candidate geometries for query().
+        candidates = tree.query(geom)
+        for cand in candidates:
+            j = geom_id_to_idx.get(id(cand))
+            if j is None or j <= i:
+                continue
+
+            # Require a non-trivial shared boundary segment to avoid broad
+            # intersects() behaviour (overlaps/contains) from over-connecting.
+            shared_len = geom.boundary.intersection(cand.boundary).length
+            if shared_len >= MIN_SHARED_BOUNDARY_M:
+                pni = plot_numbers[i]
+                pnj = plot_numbers[j]
+                adjacency[pni].add(pnj)
+                adjacency[pnj].add(pni)
+
+    return adjacency
+
+
+def _topology_agreement(
+    plot_number: str,
+    dx_m: float,
+    dy_m: float,
+    adjacency: dict[str, set[str]],
+    anchor_by_plot: dict[str, tuple[float, float, float]],
+) -> float:
+    """Agreement score from topological neighbours (shared boundaries).
+
+    Returns [0,1], where 0.5 is neutral when too few adjacent anchors exist.
+    """
+    neigh = adjacency.get(plot_number, set())
+    vals_dx, vals_dy, vals_w = [], [], []
+    for nb in neigh:
+        anchor = anchor_by_plot.get(nb)
+        if anchor is None:
+            continue
+        ndx, ndy, trust = anchor
+        vals_dx.append(ndx)
+        vals_dy.append(ndy)
+        vals_w.append(trust)
+
+    if len(vals_dx) < 2:
+        return 0.5
+
+    def _wmedian(vals, wts):
+        order = np.argsort(vals)
+        sv = np.array(vals)[order]
+        sw = np.array(wts)[order]
+        cum = np.cumsum(sw)
+        idx = np.searchsorted(cum, cum[-1] * 0.5)
+        return float(sv[min(idx, len(sv) - 1)])
+
+    w = np.array(vals_w)
+    dx_arr = np.array(vals_dx)
+    dy_arr = np.array(vals_dy)
+    med_dx = _wmedian(vals_dx, vals_w)
+    med_dy = _wmedian(vals_dy, vals_w)
+    std_dx = float(np.sqrt(np.sum(w * (dx_arr - med_dx) ** 2) / np.sum(w))) + 1e-3
+    std_dy = float(np.sqrt(np.sum(w * (dy_arr - med_dy) ** 2) / np.sum(w))) + 1e-3
+
+    z = math.sqrt(((dx_m - med_dx) / std_dx) ** 2 + ((dy_m - med_dy) / std_dy) ** 2)
+    return float(math.exp(-z / 2.0))
+
+
 # ════════════════════════════════════════════════════════════════════════════════════
 # H1 Score: Joint Evidence of Misplacement (Not Geometry Error)
 # ════════════════════════════════════════════════════════════════════════════════════
@@ -419,7 +509,8 @@ def compute_h1_score(icp_quality: float, agreement: float, imagery_signal: float
 # ════════════════════════════════════════════════════════════════════════════════════
 
 def reassess_plot(pn, geom, props, img_crs, edge_src, 
-                  anchor_lons, anchor_lats, anchor_dxs, anchor_dys, anchor_trusts):
+                  anchor_lons, anchor_lats, anchor_dxs, anchor_dys, anchor_trusts,
+                  adjacency, anchor_by_plot):
     """
     Re-evaluate a single plot using current anchor pool.
     
@@ -456,9 +547,14 @@ def reassess_plot(pn, geom, props, img_crs, edge_src,
         
         imagery_signal = min(1.0, edge_count / 80.0)
         area_ratio_score = compute_area_ratio_score(map_area, rec_area, pot_kh)
-        agreement = _zscore_agreement(
+        radial_agreement = _zscore_agreement(
             dx_m, dy_m, clon, clat,
             anchor_lons, anchor_lats, anchor_dxs, anchor_dys, anchor_trusts
+        )
+        topo_agreement = _topology_agreement(pn, dx_m, dy_m, adjacency, anchor_by_plot)
+        agreement = (
+            (1.0 - TOPOLOGY_AGREEMENT_WEIGHT) * radial_agreement
+            + TOPOLOGY_AGREEMENT_WEIGHT * topo_agreement
         )
         
         icp_quality = inlier_frac if failure_mode != 'no_signal' else 0.0
@@ -487,6 +583,13 @@ def main():
         truths = json.load(f)
 
     truth_idx = {str(feat["properties"]["plot_number"]): feat for feat in truths["features"]}
+    input_by_pn = {
+        str(feat["properties"]["plot_number"]): feat
+        for feat in inputs["features"]
+    }
+
+    print("Building parcel adjacency graph...")
+    adjacency = build_adjacency_graph(inputs["features"])
 
     img_src = rasterio.open(IMAGERY_TIF)
     edge_src = rasterio.open(BOUNDARY_TIF)
@@ -504,23 +607,26 @@ def main():
     anchor_lons, anchor_lats = [], []
     anchor_dxs, anchor_dys = [], []
     anchor_trusts = []
+    anchor_by_plot: dict[str, tuple[float, float, float]] = {}
 
     for feat in truths["features"]:
         pn = str(feat["properties"]["plot_number"])
-        for inp in inputs["features"]:
-            if str(inp["properties"]["plot_number"]) == pn:
-                t_geom = shape(feat["geometry"])
-                o_geom = shape(inp["geometry"])
-                tlon, tlat = t_geom.centroid.x, t_geom.centroid.y
-                olon, olat = o_geom.centroid.x, o_geom.centroid.y
-                dx = (tlon - olon) * 111320 * math.cos(math.radians(tlat))
-                dy = (tlat - olat) * 111320
-                anchor_lons.append(olon)
-                anchor_lats.append(olat)
-                anchor_dxs.append(dx)
-                anchor_dys.append(dy)
-                anchor_trusts.append(1.0)
-                break
+        inp = input_by_pn.get(pn)
+        if inp is None:
+            continue
+
+        t_geom = shape(feat["geometry"])
+        o_geom = shape(inp["geometry"])
+        tlon, tlat = t_geom.centroid.x, t_geom.centroid.y
+        olon, olat = o_geom.centroid.x, o_geom.centroid.y
+        dx = (tlon - olon) * 111320 * math.cos(math.radians(tlat))
+        dy = (tlat - olat) * 111320
+        anchor_lons.append(olon)
+        anchor_lats.append(olat)
+        anchor_dxs.append(dx)
+        anchor_dys.append(dy)
+        anchor_trusts.append(1.0)
+        anchor_by_plot[pn] = (dx, dy, 1.0)
 
     print(f"L1 anchors (ground truth): {len(anchor_lons)}")
 
@@ -599,9 +705,14 @@ def main():
         shift_m = math.sqrt(dx_m**2 + dy_m**2)
 
         # ── Confidence Signals ────────────────────────────────────────────────
-        agreement = _zscore_agreement(
+        radial_agreement = _zscore_agreement(
             dx_m, dy_m, clon, clat,
             anchor_lons, anchor_lats, anchor_dxs, anchor_dys, anchor_trusts
+        )
+        topo_agreement = _topology_agreement(pn, dx_m, dy_m, adjacency, anchor_by_plot)
+        agreement = (
+            (1.0 - TOPOLOGY_AGREEMENT_WEIGHT) * radial_agreement
+            + TOPOLOGY_AGREEMENT_WEIGHT * topo_agreement
         )
 
         # ── H1 Score: Joint Evidence ──────────────────────────────────────────
@@ -611,7 +722,7 @@ def main():
         # ── L2 Anchor Promotion (strong imagery + area) ────────────────────────
         if (failure_mode == 'good' and inlier_frac >= L2_INLIER_MIN
                 and L2_RATIO_LO <= area_ratio <= L2_RATIO_HI):
-            l2_queue.append((clon, clat, dx_m, dy_m))
+            l2_queue.append((pn, clon, clat, dx_m, dy_m))
 
         # ── Restraint: Flag if uncertain or minimal shift ─────────────────────
         if shift_m < MIN_SHIFT_M or h1_score < MIN_CONFIDENCE:
@@ -639,12 +750,9 @@ def main():
             "geometry": mapping(new_geom),
         })
 
-    img_src.close()
-    edge_src.close()
-
     # ── Commit L2 anchors (deduplicated) ──────────────────────────────────────
     seen = set()
-    for alon, alat, adx, ady in l2_queue:
+    for pn, alon, alat, adx, ady in l2_queue:
         # 100m grid cell: prevents cluster self-reinforcement where a
         # locally-correlated ICP mistake gets amplified via dense neighbours.
         # round(_, 3) ≈ 0.001° ≈ 111 m per cell.
@@ -656,6 +764,7 @@ def main():
             anchor_dxs.append(adx)
             anchor_dys.append(ady)
             anchor_trusts.append(L2_TRUST)
+            anchor_by_plot[pn] = (adx, ady, L2_TRUST)
 
     l1_count = sum(1 for t in anchor_trusts if t == 1.0)
     l2_count = sum(1 for t in anchor_trusts if t == L2_TRUST)
@@ -669,105 +778,109 @@ def main():
         confs = [r["confidence"] for r in corrected]
         print(f"  confidence: min={min(confs):.2f}  median={sorted(confs)[len(confs)//2]:.2f}  max={max(confs):.2f}")
 
-    # ── Second Pass: Re-assess flagged plots with enriched anchor pool ─────────
-    print(f"\n[PASS 2] Re-assessing {len(flagged)} flagged plots with enriched anchor network...")
-    
-    # Analyze why plots are flagged
-    small_shift_count = 0
-    low_conf_count = 0
-    for flag_result in flagged:
-        note = flag_result.get("method_note", "")
-        if "shift=" in note and ("h1=" in note):
-            # Extract shift and h1 from note
+    # ── Iterative Re-assessment: propagate until convergence ───────────────────
+    print(f"\n[ITERATIVE PASS] Re-assessing {len(flagged)} flagged plots until convergence...")
+    total_upgraded = 0
+
+    for pass_idx in range(1, MAX_REASSESSMENT_PASSES + 1):
+        flagged_now = [r for r in results if r["status"] == "flagged"]
+        if not flagged_now:
+            print(f"  pass {pass_idx}: no flagged plots left")
+            break
+
+        upgraded_this_pass = 0
+        confidence_deltas: list[float] = []
+        new_anchor_candidates = []
+
+        print(f"  pass {pass_idx}: evaluating {len(flagged_now)} flagged plots")
+
+        for i, flag_result in enumerate(flagged_now):
+            if i % 100 == 0 and i > 0:
+                print(f"    [{i}/{len(flagged_now)}] re-assessing...")
+
+            pn = flag_result["plot_number"]
+            orig_feat = input_by_pn.get(pn)
+            if orig_feat is None:
+                continue
+
+            geom = shape(orig_feat["geometry"])
+            props = orig_feat["properties"]
+
+            h1_score, dx_m, dy_m, inlier_frac, failure_mode, can_upgrade = reassess_plot(
+                pn, geom, props, img_crs, edge_src,
+                anchor_lons, anchor_lats, anchor_dxs, anchor_dys, anchor_trusts,
+                adjacency, anchor_by_plot,
+            )
+
+            shift_m = math.sqrt(dx_m**2 + dy_m**2)
+
             try:
-                shift_str = note.split("shift=")[1].split("m")[0]
-                shift_val = float(shift_str)
-                h1_str = note.split("h1=")[1].split()[0]
-                h1_val = float(h1_str)
-                if shift_val < MIN_SHIFT_M:
-                    small_shift_count += 1
-                if h1_val < MIN_CONFIDENCE:
-                    low_conf_count += 1
-            except:
+                note = flag_result.get("method_note", "")
+                p1_h1 = float(note.split("h1=")[1].split()[0])
+                confidence_deltas.append(h1_score - p1_h1)
+            except (IndexError, ValueError):
                 pass
-        elif "area_ratio=" in note:
-            small_shift_count += 1  # flagged for area ratio = small decision
-    
-    print(f"  flagged reasons: ~{small_shift_count} small shift, ~{low_conf_count} low confidence")
-    
-    upgraded = 0
-    upgraded_details = {"conf_improved": 0}
-    confidence_deltas: list[float] = []
-    
-    for i, flag_result in enumerate(flagged):
-        if i % 100 == 0 and i > 0:
-            print(f"  [{i}/{len(flagged)}] re-assessing...")
-        
-        pn = flag_result["plot_number"]
-        # Find original input geometry
-        orig_feat = None
-        for feat in inputs["features"]:
-            if str(feat["properties"]["plot_number"]) == pn:
-                orig_feat = feat
-                break
-        
-        if orig_feat is None:
-            continue
-        
-        geom = shape(orig_feat["geometry"])
-        props = orig_feat["properties"]
-        
-        h1_score, dx_m, dy_m, inlier_frac, failure_mode, can_upgrade = reassess_plot(
-            pn, geom, props, img_crs, edge_src,
-            anchor_lons, anchor_lats, anchor_dxs, anchor_dys, anchor_trusts
-        )
-        
-        shift_m = math.sqrt(dx_m**2 + dy_m**2)
-        
-        # Track confidence delta (pass2_h1 - pass1_h1) for all reassessed plots
-        try:
-            note = flag_result.get("method_note", "")
-            p1_h1 = float(note.split("h1=")[1].split()[0])
-            confidence_deltas.append(h1_score - p1_h1)
-        except (IndexError, ValueError):
-            pass
-        
-        # If confidence now meets threshold, upgrade from flagged → corrected
-        # can_upgrade already encodes h1_score >= REASSESSMENT_THRESHOLD (0.20)
-        if can_upgrade and shift_m >= REASSESSMENT_MIN_SHIFT_M:
-            clon, clat = geom.centroid.x, geom.centroid.y
-            new_geom = _apply_shift_lonlat(geom, dx_m, dy_m, clat)
-            
-            # Update the result from flagged → corrected
-            old_note = flag_result.get("method_note", "")
-            flag_result["status"] = "corrected"
-            flag_result["confidence"] = round(h1_score, 3)
-            flag_result["method_note"] = f"[PASS2] icp dx={dx_m:.1f}m dy={dy_m:.1f}m inlier={inlier_frac:.2f} mode={failure_mode} h1={h1_score:.2f} (from: {old_note})"
-            flag_result["geometry"] = mapping(new_geom)
-            upgraded += 1
-            upgraded_details["conf_improved"] += 1
-    
-    print(f"  upgraded: {upgraded} plots from flagged → corrected")
-    if upgraded > 0:
-        print(f"    - confidence improved: {upgraded_details['conf_improved']}")
-    
-    # Confidence delta analysis: did pass 2 reveal new evidence or just confirm uncertainty?
-    if confidence_deltas:
-        deltas = sorted(confidence_deltas)
-        n = len(deltas)
-        median_d = deltas[n // 2]
-        p95_d = deltas[int(n * 0.95)]
-        max_d = deltas[-1]
-        print(f"  confidence_delta (pass2 - pass1): median={median_d:+.3f}  p95={p95_d:+.3f}  max={max_d:+.3f}")
-        if max_d < 0.05:
-            print("  → Pass 2 confirmed uncertainty rather than revealing new evidence.")
+
+            if can_upgrade and shift_m >= REASSESSMENT_MIN_SHIFT_M:
+                clon, clat = geom.centroid.x, geom.centroid.y
+                new_geom = _apply_shift_lonlat(geom, dx_m, dy_m, clat)
+
+                old_note = flag_result.get("method_note", "")
+                flag_result["status"] = "corrected"
+                flag_result["confidence"] = round(h1_score, 3)
+                flag_result["method_note"] = (
+                    f"[PASS{pass_idx}] icp dx={dx_m:.1f}m dy={dy_m:.1f}m "
+                    f"inlier={inlier_frac:.2f} mode={failure_mode} h1={h1_score:.2f} "
+                    f"(from: {old_note})"
+                )
+                flag_result["geometry"] = mapping(new_geom)
+
+                upgraded_this_pass += 1
+                new_anchor_candidates.append((pn, clon, clat, dx_m, dy_m))
+
+        # Commit anchors from newly corrected plots in this pass.
+        seen_cells = set()
+        added_anchors = 0
+        for pn, alon, alat, adx, ady in new_anchor_candidates:
+            key = (round(alon, 3), round(alat, 3))
+            if key in seen_cells:
+                continue
+            seen_cells.add(key)
+
+            if pn in anchor_by_plot:
+                continue
+
+            anchor_lons.append(alon)
+            anchor_lats.append(alat)
+            anchor_dxs.append(adx)
+            anchor_dys.append(ady)
+            anchor_trusts.append(L2_TRUST)
+            anchor_by_plot[pn] = (adx, ady, L2_TRUST)
+            added_anchors += 1
+
+        total_upgraded += upgraded_this_pass
+
+        if confidence_deltas:
+            deltas = sorted(confidence_deltas)
+            n = len(deltas)
+            median_d = deltas[n // 2]
+            p95_d = deltas[int(n * 0.95)]
+            print(
+                f"    delta h1: median={median_d:+.3f} p95={p95_d:+.3f} "
+                f"upgraded={upgraded_this_pass} anchors+={added_anchors}"
+            )
         else:
-            print(f"  → {sum(d > 0.05 for d in deltas)} plots gained meaningful confidence in pass 2.")
+            print(f"    upgraded={upgraded_this_pass} anchors+={added_anchors}")
+
+        if upgraded_this_pass == 0 and added_anchors == 0:
+            print(f"  convergence reached at pass {pass_idx}")
+            break
     
     # Update counts
     corrected = [r for r in results if r["status"] == "corrected"]
     flagged = [r for r in results if r["status"] == "flagged"]
-    print(f"\nFinal counts after 2 passes:")
+    print(f"\nTotal upgraded during iterative reassessment: {total_upgraded}")
+    print(f"\nFinal counts after iterative passes:")
     print(f"  corrected: {len(corrected)}")
     print(f"  flagged:   {len(flagged)}")
     if corrected:
@@ -793,6 +906,9 @@ def main():
     out = {"type": "FeatureCollection", "features": features}
     with open(OUTPUT_GEOJSON, "w") as f:
         json.dump(out, f)
+
+    img_src.close()
+    edge_src.close()
 
     print(f"\nWritten → {OUTPUT_GEOJSON}")
 
